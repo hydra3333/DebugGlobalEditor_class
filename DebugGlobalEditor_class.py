@@ -399,10 +399,12 @@ class DebugGlobalEditor_class:
 
     def _create_window(self):
         win = tk.Toplevel(self.root)
-        self._win = win
         win.title(self.title)
+        self._win = win
+        style = ttk.Style(win)
+        style.configure("Computed.TCheckbutton", foreground="gray50")
     
-        # NEW: set ~90% screen width and 93% height
+        # Keep the larger default size (~90% width x 93% height)
         try:
             sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
             width = max(self.min_size[0], int(sw * 0.90))
@@ -415,14 +417,17 @@ class DebugGlobalEditor_class:
         win.transient(self.root)
         win.grab_set()
     
-        top = ttk.Frame(win); top.pack(fill="x", padx=8, pady=6)
+        top = ttk.Frame(win)
+        top.pack(fill="x", padx=8, pady=6)
         ttk.Label(top, text=self.title, font=("TkDefaultFont", 11, "bold")).pack(side="left")
         if self.allow_recompute:
+            self._recompute_var.set(True)  # ensure checked by default
             ttk.Checkbutton(top, text="Recompute Derived", variable=self._recompute_var).pack(side="right")
         ttk.Label(win, textvariable=self._message_var, foreground="red").pack(fill="x", padx=8)
     
         # Scrollable grid
-        container = ttk.Frame(win); container.pack(fill="both", expand=True, padx=8, pady=6)
+        container = ttk.Frame(win)
+        container.pack(fill="both", expand=True, padx=8, pady=6)
         canvas = tk.Canvas(container, borderwidth=0, highlightthickness=0)
         vscroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
         body = ttk.Frame(canvas)
@@ -432,15 +437,13 @@ class DebugGlobalEditor_class:
         canvas.pack(side="left", fill="both", expand=True)
         vscroll.pack(side="right", fill="y")
     
-        # NEW: add columns "Expr" and "Depends"
+        # Columns (adds Expr & Depends)
         headers = ["Name", "Type", "Value", "Changed", "Apply?", "Expr", "Depends"]
-        base_widths = list(self.column_widths) if isinstance(self.column_widths, (list, tuple)) else [300, 80, 300, 90, 90]
-        if len(base_widths) < 5:
-            base_widths = [300, 80, 300, 90, 90]
-        col_widths = base_widths + [360, 260]
-    
+        col_widths = [300, 80, 300, 90, 90, 360, 260]
         for i, h in enumerate(headers):
-            ttk.Label(body, text=h, font=("TkDefaultFont", 9, "bold")).grid(row=0, column=i, sticky="w", padx=4, pady=(0,4))
+            ttk.Label(body, text=h, font=("TkDefaultFont", 9, "bold")).grid(
+                row=0, column=i, sticky="w", padx=4, pady=(0, 4)
+            )
             body.grid_columnconfigure(i, minsize=col_widths[i])
     
         # Build dep-graph once for the grid
@@ -457,6 +460,13 @@ class DebugGlobalEditor_class:
             if name not in snapshot:
                 continue
             vtype = type(val)
+    
+            # Lookup dep info early so we can decide read-only state
+            info = info_by_name.get(name)
+            expr_text = info.expr_str if (info and info.expr_str) else ""
+            deps_text = ", ".join(sorted(info.depends_on)) if (info and info.depends_on) else ""
+            is_computed = bool(expr_text)
+    
             rec = {
                 "name": name,
                 "type": vtype,
@@ -469,54 +479,71 @@ class DebugGlobalEditor_class:
                 "valid": True,
                 "widgets": {},
             }
+    
             # Name
             w_name = ttk.Label(body, text=name)
             w_name.grid(row=row_idx, column=0, sticky="w", padx=4, pady=2)
-            w_name.bind("<Button-1>", lambda e, nm=name: self._select_row(nm))
             rec["widgets"]["name"] = w_name
+    
             # Type
             w_type = ttk.Label(body, text=vtype.__name__)
             w_type.grid(row=row_idx, column=1, sticky="w", padx=4, pady=2)
             rec["widgets"]["type"] = w_type
-            # Value
+    
+            # Value (READ-ONLY for computed globals)
             if vtype is bool:
                 w_val = ttk.Checkbutton(body, variable=rec["boolvar"])
+                if is_computed:
+                    w_val.state(["disabled"])
+                    w_val.configure(style="Computed.TCheckbutton")
+                else:
+                    w_val.bind("<ButtonRelease-1>", lambda e, nm=name: self._on_value_changed(nm))
                 w_val.grid(row=row_idx, column=2, sticky="w", padx=4, pady=2)
-                w_val.bind("<ButtonRelease-1>", lambda e, nm=name: self._on_value_changed(nm))
             else:
                 w_val = ttk.Entry(body, textvariable=rec["candidate"])
+                if is_computed:
+                    w_val.state(["readonly"])
+                    w_val.configure(foreground="gray50")
+                else:
+                    w_val.bind("<KeyRelease>", lambda e, nm=name: self._on_value_changed(nm))
+                    w_val.bind("<FocusOut>", lambda e, nm=name: self._on_value_changed(nm))
                 w_val.grid(row=row_idx, column=2, sticky="ew", padx=4, pady=2)
-                w_val.bind("<KeyRelease>", lambda e, nm=name: self._on_value_changed(nm))
-                w_val.bind("<FocusOut>", lambda e, nm=name: self._on_value_changed(nm))
+
             rec["widgets"]["value"] = w_val
-            # Changed (ro)
-            w_changed = ttk.Checkbutton(body, variable=rec["changed"]); w_changed.state(["disabled"])
+    
+            # Changed (read-only)
+            w_changed = ttk.Checkbutton(body, variable=rec["changed"])
+            w_changed.state(["disabled"])
             w_changed.grid(row=row_idx, column=3, sticky="w", padx=4, pady=2)
             rec["widgets"]["changed"] = w_changed
+    
             # Apply?
             w_apply = ttk.Checkbutton(body, variable=rec["apply"], command=lambda nm=name: self._on_apply_toggled(nm))
             w_apply.grid(row=row_idx, column=4, sticky="w", padx=4, pady=2)
             rec["widgets"]["apply"] = w_apply
     
-            # NEW: Expr and Depends textboxes (readonly)
-            info = info_by_name.get(name)
-            expr_text = info.expr_str if (info and info.expr_str) else ""
-            deps_text = ", ".join(sorted(info.depends_on)) if (info and info.depends_on) else ""
+            # Expr (readonly text)
+            w_expr = ttk.Entry(body)
+            w_expr.insert(0, expr_text)
+            if expr_text:
+                w_expr.state(["readonly"])
+            w_expr.grid(row=row_idx, column=5, sticky="ew", padx=4, pady=2)
     
-            w_expr = ttk.Entry(body); w_expr.grid(row=row_idx, column=5, sticky="ew", padx=4, pady=2)
-            w_expr.configure(state="normal"); w_expr.delete(0, tk.END); w_expr.insert(0, expr_text)
-            if expr_text: w_expr.configure(state="readonly")
-    
-            w_deps = ttk.Entry(body); w_deps.grid(row=row_idx, column=6, sticky="ew", padx=4, pady=2)
-            w_deps.configure(state="normal"); w_deps.delete(0, tk.END); w_deps.insert(0, deps_text)
-            if deps_text: w_deps.configure(state="readonly")
+            # Depends (readonly text)
+            w_deps = ttk.Entry(body)
+            w_deps.insert(0, deps_text)
+            if deps_text:
+                w_deps.state(["readonly"])
+            w_deps.grid(row=row_idx, column=6, sticky="ew", padx=4, pady=2)
     
             self._rows.append(rec)
             row_idx += 1
     
         # Inspector
-        insp = ttk.LabelFrame(win, text="Dependency Inspector"); insp.pack(fill="x", padx=8, pady=(0,6))
-        frm = ttk.Frame(insp); frm.pack(fill="x", padx=6, pady=6)
+        insp = ttk.LabelFrame(win, text="Dependency Inspector")
+        insp.pack(fill="x", padx=8, pady=(0, 6))
+        frm = ttk.Frame(insp)
+        frm.pack(fill="x", padx=6, pady=6)
         ttk.Label(frm, text="Expression:").grid(row=0, column=0, sticky="nw")
         ttk.Label(frm, textvariable=self._inspector_expr, justify="left", wraplength=900).grid(row=0, column=1, sticky="w", padx=8)
         ttk.Label(frm, text="Depends on:").grid(row=1, column=0, sticky="nw")
@@ -527,17 +554,20 @@ class DebugGlobalEditor_class:
         ttk.Label(frm, textvariable=self._inspector_preview, justify="left", wraplength=900).grid(row=3, column=1, sticky="w", padx=8)
     
         # Bottom bar
-        bottom = ttk.Frame(win); bottom.pack(fill="x", padx=8, pady=8)
-        self._apply_btn = ttk.Button(bottom, text="Apply", command=self._on_apply); self._apply_btn.pack(side="right", padx=(6,0))
-        ttk.Button(bottom, text="Quit", command=self._on_quit).pack(side="right", padx=(6,0))
-        ttk.Button(bottom, text="Revert to Defaults", command=self._on_revert_defaults).pack(side="left", padx=(0,6))
-        ttk.Button(bottom, text="Save JSON", command=self._on_save_json).pack(side="left", padx=(0,6))
-        ttk.Button(bottom, text="Load JSON", command=self._on_load_json).pack(side="left", padx=(0,6))
+        bottom = ttk.Frame(win)
+        bottom.pack(fill="x", padx=8, pady=8)
+        self._apply_btn = ttk.Button(bottom, text="Apply", command=self._on_apply)
+        self._apply_btn.pack(side="right", padx=(6, 0))
+        ttk.Button(bottom, text="Quit", command=self._on_quit).pack(side="right", padx=(6, 0))
+        ttk.Button(bottom, text="Revert to Defaults", command=self._on_revert_defaults).pack(side="left", padx=(0, 6))
+        ttk.Button(bottom, text="Save JSON", command=self._on_save_json).pack(side="left", padx=(0, 6))
+        ttk.Button(bottom, text="Load JSON", command=self._on_load_json).pack(side="left", padx=(0, 6))
     
         if self._rows:
             self._select_row(self._rows[0]["name"])
     
         self._refresh_apply_enabled()
+
     # ---------------- Value handling ----------------
 
     def _fmt(self, val, vtype: type) -> str:
