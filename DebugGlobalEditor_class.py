@@ -1,0 +1,604 @@
+#=================================================================================================================
+# NOTE: MOVE THESE TO THE TOP OF THE PROGRAM
+from __future__ import annotations
+import ast
+import inspect
+import json
+import locale
+import math
+import sys
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from types import ModuleType
+#=================================================================================================================
+
+
+#=================================================================================================================
+class DebugGlobalEditor_class:
+    """
+    DebugGlobalEditor_class.py
+    Single-class, drop-in Tkinter dialog to view/edit top-level simple globals and optionally
+    recompute derived globals via AST. Python 3.13.5+. No external deps.
+    
+    Usage (example):
+        if __debug__:
+            editor = DebugGlobalEditor_class(root)  # root is your Tk() or Toplevel
+            result = editor.open()
+
+    Single-class implementation:
+    - All helpers are nested as inner classes or static methods.
+    - Hard guard: only top-level assignments are discovered & recomputed.
+    - Supports JSON save/load, revert to defaults, dependency inspector.
+    """
+    # --- Config / Whitelists ---
+    SIMPLE_TYPES = (str, int, float, bool)
+    SAFE_BUILTINS = {"abs": abs, "round": round, "min": min, "max": max}
+    SAFE_MODULES = {"math": math}
+
+    # Global defaults and dep-graph cache (per process)
+    _DEFAULTS_SNAPSHOT: dict[str, object] | None = None
+    _DEP_CACHE: dict[str, tuple[dict[str, "DebugGlobalEditor_class._DepInfo"], dict[str, set[str]]]] = {}
+
+    class _DepVisitor(ast.NodeVisitor):
+        """Collect names and determine if expression is eligible for safe recompute."""
+        def __init__(self, safe_builtins: set[str], safe_modules: set[str]):
+            self.names: set[str] = set()
+            self.eligible: bool = True
+            self.reason: str | None = None
+            self._safe_builtins = safe_builtins
+            self._safe_modules = safe_modules
+
+        def visit_Name(self, node: ast.Name):
+            self.names.add(node.id)
+
+        def visit_Call(self, node: ast.Call):
+            # Allow calls to math.* or whitelisted builtins
+            ok = False
+            if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+                if node.func.value.id in self._safe_modules:
+                    ok = True
+            elif isinstance(node.func, ast.Name):
+                if node.func.id in self._safe_builtins:
+                    ok = True
+            if not ok:
+                self.eligible = False
+                self.reason = "contains non-whitelisted function call"
+                return
+            self.generic_visit(node)
+
+        def visit_Attribute(self, node: ast.Attribute):
+            # Only allow attribute access on whitelisted modules
+            if isinstance(node.value, ast.Name):
+                if node.value.id not in self._safe_modules:
+                    self.eligible = False
+                    self.reason = "attribute access on non-whitelisted object"
+                    return
+            self.generic_visit(node)
+
+        def visit_Import(self, node):  # pragma: no cover
+            self.eligible = False
+            self.reason = "import not allowed"
+
+        def visit_ImportFrom(self, node):  # pragma: no cover
+            self.eligible = False
+            self.reason = "import not allowed"
+
+        def visit_Lambda(self, node):  # pragma: no cover
+            self.eligible = False
+            self.reason = "lambda not allowed"
+
+        def visit_Await(self, node):  # pragma: no cover
+            self.eligible = False
+            self.reason = "await not allowed"
+
+    class _DepInfo:
+        __slots__ = ("expr_str", "depends_on", "eligible", "reason", "rhs_ast")
+        def __init__(self, expr_str: str | None, depends_on: set[str], eligible: bool, reason: str | None, rhs_ast: ast.AST):
+            self.expr_str = expr_str
+            self.depends_on = depends_on
+            self.eligible = eligible
+            self.reason = reason
+            self.rhs_ast = rhs_ast
+
+    def __init__(self, root: tk.Misc, module: ModuleType | None = None, *,
+                 title: str = "Debug Globals",
+                 column_widths: tuple[int, int, int, int, int] | None = None,
+                 min_size: tuple[int, int] = (1000, 600),
+                 allow_recompute: bool = True,
+                 locale_floats: bool = True,
+                 on_apply = None):
+        if not __debug__:
+            raise RuntimeError("DebugGlobalEditor_class is debug-only and requires __debug__ == True.")
+        self.root = root
+        self.module = module or self._get_caller_module()
+        if self.module is None:
+            raise RuntimeError("Unable to resolve caller module.")
+        self.title = title
+        self.column_widths = column_widths or (300, 80, 300, 90, 90)
+        self.min_size = min_size
+        self.allow_recompute = allow_recompute
+        self.locale_floats = locale_floats
+        self.on_apply = on_apply
+
+        # UI state
+        self._win: tk.Toplevel | None = None
+        self._rows: list[dict] = []
+        self._apply_btn: ttk.Button | None = None
+        self._recompute_var = tk.BooleanVar(value=False) if allow_recompute else None
+        self._message_var = tk.StringVar(value="")
+
+        # Inspector state
+        self._inspected_name: str | None = None
+        self._inspector_expr = tk.StringVar(value="")
+        self._inspector_deps = tk.StringVar(value="")
+        self._inspector_elig = tk.StringVar(value="")
+        self._inspector_preview = tk.StringVar(value="")
+
+        if DebugGlobalEditor_class._DEFAULTS_SNAPSHOT is None:
+            DebugGlobalEditor_class._DEFAULTS_SNAPSHOT = self._current_simple_globals_snapshot()
+
+        self._module_key = getattr(self.module, "__file__", repr(self.module))
+
+    # ---------------- Public API ----------------
+
+    def open(self) -> dict:
+        """Open the modal dialog and return {'applied': bool, 'changes': {...}}"""
+        self._create_window()
+        self._win.wait_window()
+        return getattr(self, "_result", {"applied": False})
+
+    # ---------------- Helpers ----------------
+
+    @staticmethod
+    def _get_caller_module() -> ModuleType | None:
+        for frameinfo in inspect.stack():
+            mod = inspect.getmodule(frameinfo.frame)
+            if mod and mod is not sys.modules[__name__]:
+                return mod
+        return sys.modules.get("__main__", None)
+
+    def _current_simple_globals_snapshot(self) -> dict[str, object]:
+        out = {}
+        for name, val in self.module.__dict__.items():
+            if name.startswith("_"):
+                continue
+            if isinstance(val, self.SIMPLE_TYPES):
+                out[name] = val
+        return out
+
+    @staticmethod
+    def _unparse(node: ast.AST) -> str | None:
+        try:
+            return ast.unparse(node)
+        except Exception:
+            return None
+
+    @classmethod
+    def _top_level_assignments(cls, tree: ast.AST) -> list[tuple[str, ast.AST]]:
+        """Return list of (name, rhs_expr_ast) for top-level Assign/AnnAssign simple targets only."""
+        out: list[tuple[str, ast.AST]] = []
+        if not isinstance(tree, ast.Module):
+            return out
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                out.append((node.targets[0].id, node.value))
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                if node.value is not None:
+                    out.append((node.target.id, node.value))
+        return out
+
+    @classmethod
+    def _topo_sort(cls, deps: dict[str, set[str]]) -> list[str]:
+        """deps: name -> set of names it depends on; return order with deps first."""
+        visited: dict[str, int] = {}
+        order: list[str] = []
+
+        def visit(n: str):
+            state = visited.get(n, 0)
+            if state == 1:
+                return  # cycle ignored
+            if state == 2:
+                return
+            visited[n] = 1
+            for m in deps.get(n, ()):
+                visit(m)
+            visited[n] = 2
+            order.append(n)
+
+        for k in deps:
+            visit(k)
+        return order
+
+    def _build_dep_graph(self):
+        cached = DebugGlobalEditor_class._DEP_CACHE.get(self._module_key)
+        if cached:
+            return cached
+
+        info_by_name: dict[str, DebugGlobalEditor_class._DepInfo] = {}
+        deps: dict[str, set[str]] = {}
+
+        filename = getattr(self.module, "__file__", None)
+        if filename:
+            try:
+                with open(filename, "r", encoding="utf-8") as f:
+                    source = f.read()
+                tree = ast.parse(source, filename=filename)
+                for tgt, rhs in self._top_level_assignments(tree):
+                    visitor = self._DepVisitor(set(self.SAFE_BUILTINS.keys()), set(self.SAFE_MODULES.keys()))
+                    visitor.visit(rhs)
+                    expr_str = self._unparse(rhs)
+                    info_by_name[tgt] = self._DepInfo(expr_str, set(visitor.names), visitor.eligible, visitor.reason, rhs)
+                    deps.setdefault(tgt, set()).update(info_by_name[tgt].depends_on)
+            except Exception:
+                pass  # leave empty
+
+        DebugGlobalEditor_class._DEP_CACHE[self._module_key] = (info_by_name, deps)
+        return info_by_name, deps
+
+    # ---------------- UI Build ----------------
+
+    def _create_window(self):
+        win = tk.Toplevel(self.root)
+        self._win = win
+        win.title(self.title)
+        win.minsize(*self.min_size)
+        win.transient(self.root)
+        win.grab_set()
+
+        top = ttk.Frame(win); top.pack(fill="x", padx=8, pady=6)
+        ttk.Label(top, text=self.title, font=("TkDefaultFont", 11, "bold")).pack(side="left")
+        if self.allow_recompute:
+            ttk.Checkbutton(top, text="Recompute Derived", variable=self._recompute_var).pack(side="right")
+        ttk.Label(win, textvariable=self._message_var, foreground="red").pack(fill="x", padx=8)
+
+        # Scrollable grid
+        container = ttk.Frame(win); container.pack(fill="both", expand=True, padx=8, pady=6)
+        canvas = tk.Canvas(container, borderwidth=0, highlightthickness=0)
+        vscroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        body = ttk.Frame(canvas)
+        body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.configure(yscrollcommand=vscroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vscroll.pack(side="right", fill="y")
+
+        headers = ["Name", "Type", "Value", "Changed", "Apply?"]
+        for i, h in enumerate(headers):
+            ttk.Label(body, text=h, font=("TkDefaultFont", 9, "bold")).grid(row=0, column=i, sticky="w", padx=4, pady=(0,4))
+            body.grid_columnconfigure(i, minsize=self.column_widths[i])
+
+        # Rows
+        snapshot = self._current_simple_globals_snapshot()
+        row_idx = 1
+        for name, val in self.module.__dict__.items():
+            if name not in snapshot:
+                continue
+            vtype = type(val)
+            rec = {
+                "name": name,
+                "type": vtype,
+                "orig": val,
+                "candidate": tk.StringVar(value=self._fmt(val, vtype)),
+                "boolvar": tk.BooleanVar(value=bool(val)) if vtype is bool else None,
+                "changed": tk.BooleanVar(value=False),
+                "apply": tk.BooleanVar(value=False),
+                "apply_overridden": False,
+                "valid": True,
+                "widgets": {},
+            }
+            # Name
+            w_name = ttk.Label(body, text=name)
+            w_name.grid(row=row_idx, column=0, sticky="w", padx=4, pady=2)
+            w_name.bind("<Button-1>", lambda e, nm=name: self._select_row(nm))
+            rec["widgets"]["name"] = w_name
+            # Type
+            w_type = ttk.Label(body, text=vtype.__name__)
+            w_type.grid(row=row_idx, column=1, sticky="w", padx=4, pady=2)
+            rec["widgets"]["type"] = w_type
+            # Value
+            if vtype is bool:
+                w_val = ttk.Checkbutton(body, variable=rec["boolvar"])
+                w_val.grid(row=row_idx, column=2, sticky="w", padx=4, pady=2)
+                w_val.bind("<ButtonRelease-1>", lambda e, nm=name: self._on_value_changed(nm))
+            else:
+                w_val = ttk.Entry(body, textvariable=rec["candidate"])
+                w_val.grid(row=row_idx, column=2, sticky="ew", padx=4, pady=2)
+                w_val.bind("<KeyRelease>", lambda e, nm=name: self._on_value_changed(nm))
+                w_val.bind("<FocusOut>", lambda e, nm=name: self._on_value_changed(nm))
+            rec["widgets"]["value"] = w_val
+            # Changed (ro)
+            w_changed = ttk.Checkbutton(body, variable=rec["changed"]); w_changed.state(["disabled"])
+            w_changed.grid(row=row_idx, column=3, sticky="w", padx=4, pady=2)
+            rec["widgets"]["changed"] = w_changed
+            # Apply?
+            w_apply = ttk.Checkbutton(body, variable=rec["apply"], command=lambda nm=name: self._on_apply_toggled(nm))
+            w_apply.grid(row=row_idx, column=4, sticky="w", padx=4, pady=2)
+            rec["widgets"]["apply"] = w_apply
+
+            self._rows.append(rec)
+            row_idx += 1
+
+        # Inspector
+        insp = ttk.LabelFrame(win, text="Dependency Inspector"); insp.pack(fill="x", padx=8, pady=(0,6))
+        frm = ttk.Frame(insp); frm.pack(fill="x", padx=6, pady=6)
+        ttk.Label(frm, text="Expression:").grid(row=0, column=0, sticky="nw")
+        ttk.Label(frm, textvariable=self._inspector_expr, justify="left", wraplength=900).grid(row=0, column=1, sticky="w", padx=8)
+        ttk.Label(frm, text="Depends on:").grid(row=1, column=0, sticky="nw")
+        ttk.Label(frm, textvariable=self._inspector_deps, justify="left", wraplength=900).grid(row=1, column=1, sticky="w", padx=8)
+        ttk.Label(frm, text="Eligible:").grid(row=2, column=0, sticky="nw")
+        ttk.Label(frm, textvariable=self._inspector_elig, justify="left").grid(row=2, column=1, sticky="w", padx=8)
+        ttk.Label(frm, text="Recompute Preview:").grid(row=3, column=0, sticky="nw")
+        ttk.Label(frm, textvariable=self._inspector_preview, justify="left", wraplength=900).grid(row=3, column=1, sticky="w", padx=8)
+
+        # Bottom bar
+        bottom = ttk.Frame(win); bottom.pack(fill="x", padx=8, pady=8)
+        self._apply_btn = ttk.Button(bottom, text="Apply", command=self._on_apply); self._apply_btn.pack(side="right", padx=(6,0))
+        ttk.Button(bottom, text="Quit", command=self._on_quit).pack(side="right", padx=(6,0))
+        ttk.Button(bottom, text="Revert to Defaults", command=self._on_revert_defaults).pack(side="left", padx=(0,6))
+        ttk.Button(bottom, text="Save JSON", command=self._on_save_json).pack(side="left", padx=(0,6))
+        ttk.Button(bottom, text="Load JSON", command=self._on_load_json).pack(side="left", padx=(0,6))
+
+        if self._rows:
+            self._select_row(self._rows[0]["name"])
+
+        self._refresh_apply_enabled()
+
+    # ---------------- Value handling ----------------
+
+    def _fmt(self, val, vtype: type) -> str:
+        if vtype is float and self.locale_floats:
+            try:
+                return locale.format_string("%f", val, grouping=False).rstrip("0").rstrip(".")
+            except Exception:
+                return str(val)
+        return str(val)
+
+    def _parse(self, s: str, vtype: type):
+        s2 = s.strip()
+        if vtype is int:
+            return int(s2, 10)
+        if vtype is float:
+            if self.locale_floats:
+                dec = locale.localeconv().get("decimal_point") or "."
+                if dec != ".":
+                    s2 = s2.replace(dec, ".")
+            ts = locale.localeconv().get("thousands_sep") or ","
+            if ts in s2:
+                raise ValueError("Thousands separators not supported")
+            return float(s2)
+        if vtype is str:
+            return s
+        if vtype is bool:
+            return bool(s)
+        raise TypeError("Unsupported type")
+
+    # ---------------- Events ----------------
+
+    def _on_value_changed(self, name: str):
+        row = next((r for r in self._rows if r["name"] == name), None)
+        if not row:
+            return
+        vtype = row["type"]
+        valid = True
+        try:
+            new_val = row["boolvar"].get() if vtype is bool else self._parse(row["candidate"].get(), vtype)
+        except Exception:
+            new_val, valid = None, False
+
+        row["valid"] = valid
+        if valid:
+            changed = (new_val != row["orig"])
+            row["changed"].set(changed)
+            if not row["apply_overridden"]:
+                row["apply"].set(changed)
+        else:
+            row["changed"].set(False)
+            if not row["apply_overridden"]:
+                row["apply"].set(False)
+
+        if self._inspected_name == name:
+            self._update_inspector(name)
+
+        self._refresh_apply_enabled()
+
+    def _on_apply_toggled(self, name: str):
+        row = next((r for r in self._rows if r["name"] == name), None)
+        if row:
+            row["apply_overridden"] = True
+            self._refresh_apply_enabled()
+
+    def _on_quit(self):
+        self._result = {"applied": False}
+        self._win.destroy()
+
+    def _on_apply(self):
+        # Validate all rows
+        for row in self._rows:
+            if not row["valid"]:
+                messagebox.showerror("Invalid value", f"Invalid value for {row['name']} ({row['type'].__name__})")
+                return
+
+        changes = {}
+        # Apply base changes
+        for row in self._rows:
+            if not row["apply"].get():
+                continue
+            name, vtype = row["name"], row["type"]
+            new_val = row["boolvar"].get() if vtype is bool else self._parse(row["candidate"].get(), vtype)
+            old_val = row["orig"]
+            if new_val != old_val:
+                setattr(self.module, name, new_val)
+                row["orig"] = new_val
+                changes[name] = {"old": old_val, "new": new_val}
+
+        # Optional recompute
+        recompute_report = []
+        if self.allow_recompute and self._recompute_var.get():
+            info_by_name, deps = self._build_dep_graph()
+            if info_by_name:
+                reverse = {}
+                for tgt, dep_set in deps.items():
+                    for dep in dep_set:
+                        reverse.setdefault(dep, set()).add(tgt)
+
+                changed_roots = set(changes.keys())
+                affected = set()
+                stack = list(changed_roots)
+                while stack:
+                    n = stack.pop()
+                    for m in reverse.get(n, ()):
+                        if m not in affected:
+                            affected.add(m); stack.append(m)
+
+                if affected:
+                    safe_globals = {n: v for n, v in self.module.__dict__.items() if isinstance(v, self.SIMPLE_TYPES)}
+                    for k, m in self.SAFE_MODULES.items():
+                        safe_globals[k] = m
+                    safe_globals["__builtins__"] = self.SAFE_BUILTINS
+
+                    order = self._topo_sort({n: info_by_name.get(n, self._DepInfo(None, set(), False, None, ast.Constant(None))).depends_on for n in affected})
+                    for name in order:
+                        info = info_by_name.get(name)
+                        if not info or not info.eligible:
+                            continue
+                        try:
+                            code = compile(info.rhs_ast, filename="<ast>", mode="eval")
+                            new_val = eval(code, safe_globals, {})
+                            if name in self.module.__dict__:
+                                old_val = getattr(self.module, name)
+                                # type compatibility check (keep simple)
+                                if type(old_val) in self.SIMPLE_TYPES and isinstance(new_val, type(old_val)):
+                                    setattr(self.module, name, new_val)
+                                    safe_globals[name] = new_val
+                                    if name not in changes or changes[name]["new"] != new_val:
+                                        changes[name] = {"old": old_val, "new": new_val}
+                                else:
+                                    recompute_report.append(f"{name}: type mismatch; skipped")
+                        except Exception as ex:
+                            recompute_report.append(f"{name}: {ex!r}")
+
+        if changes and self.on_apply:
+            try: self.on_apply(changes)
+            except Exception: pass
+
+        self.last_changes = changes
+        try: self.root.event_generate("<<DebugGlobalsApplied>>", when="tail")
+        except Exception: pass
+
+        if recompute_report:
+            self._message_var.set("; ".join(recompute_report))
+        else:
+            self._message_var.set("Applied.")
+
+        self._result = {"applied": True, "changes": changes}
+        self._win.destroy()
+
+    def _on_revert_defaults(self):
+        defaults = DebugGlobalEditor_class._DEFAULTS_SNAPSHOT or {}
+        for row in self._rows:
+            name, vtype = row["name"], row["type"]
+            if name in defaults:
+                val = defaults[name]
+                if vtype is bool:
+                    row["boolvar"].set(bool(val))
+                else:
+                    row["candidate"].set(self._fmt(val, vtype))
+                row["apply_overridden"] = False
+                self._on_value_changed(name)
+        self._message_var.set("Reverted to defaults (candidate values).")
+
+    def _on_save_json(self):
+        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
+        if not path: return
+        data = {}
+        for row in self._rows:
+            name, vtype = row["name"], row["type"]
+            if vtype is bool:
+                data[name] = bool(row["boolvar"].get())
+            else:
+                try: data[name] = self._parse(row["candidate"].get(), vtype)
+                except Exception: pass
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self._message_var.set(f"Saved to {path}")
+        except Exception as ex:
+            messagebox.showerror("Save JSON failed", str(ex))
+
+    def _on_load_json(self):
+        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("All Files", "*.*")])
+        if not path: return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as ex:
+            messagebox.showerror("Load JSON failed", str(ex)); return
+        for row in self._rows:
+            name, vtype = row["name"], row["type"]
+            if name not in data: continue
+            val = data[name]
+            # simple type check
+            if vtype is bool:
+                row["boolvar"].set(bool(val))
+            elif vtype is int and isinstance(val, int):
+                row["candidate"].set(str(val))
+            elif vtype is float and isinstance(val, (int, float)):
+                row["candidate"].set(self._fmt(float(val), float))
+            elif vtype is str and isinstance(val, str):
+                row["candidate"].set(val)
+            else:
+                continue
+            row["apply_overridden"] = False
+            self._on_value_changed(name)
+        self._message_var.set(f"Loaded from {path}")
+
+    # ---------------- Inspector ----------------
+
+    def _select_row(self, name: str):
+        self._inspected_name = name
+        self._update_inspector(name)
+
+    def _update_inspector(self, name: str):
+        info_by_name, _ = self._build_dep_graph()
+        info = info_by_name.get(name)
+        expr = info.expr_str if info and info.expr_str else "(no simple expression)"
+        self._inspector_expr.set(expr)
+
+        deps = sorted(info.depends_on) if info else []
+        self._inspector_deps.set(", ".join(deps) if deps else "(none)")
+
+        elig = "Yes" if (info and info.eligible) else "No"
+        reason = "" if not info or info.eligible else f" – {info.reason}"
+        self._inspector_elig.set(elig + reason)
+
+        if not info or not info.eligible:
+            self._inspector_preview.set("N/A"); return
+
+        # Build candidate environment (using current candidate edits)
+        cand_env = {}
+        for row in self._rows:
+            n, vtype = row["name"], row["type"]
+            try:
+                val = row["boolvar"].get() if vtype is bool else self._parse(row["candidate"].get(), vtype)
+            except Exception:
+                val = row["orig"]
+            cand_env[n] = val
+        for k, m in self.SAFE_MODULES.items():
+            cand_env[k] = m
+        cand_env["__builtins__"] = self.SAFE_BUILTINS
+
+        try:
+            code = compile(info.rhs_ast, filename="<ast>", mode="eval")
+            new_val = eval(code, cand_env, {})
+            old_val = getattr(self.module, name, None)
+            self._inspector_preview.set(f"{old_val!r} → {new_val!r}")
+        except Exception as ex:
+            self._inspector_preview.set(f"error: {ex!r}")
+
+    # ---------------- Misc ----------------
+
+    def _refresh_apply_enabled(self):
+        if not self._apply_btn: return
+        ok = all(r["valid"] for r in self._rows)
+        self._apply_btn.state(["!disabled"] if ok else ["disabled"])
+#=================================================================================================================
