@@ -1,3 +1,17 @@
+#=================================================================================================================
+# NOTE: MOVE THESE TO THE TOP OF THE PROGRAM
+from __future__ import annotations
+import ast
+import inspect
+import json
+import locale
+import math
+import sys
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from types import ModuleType
+#=================================================================================================================
+
 #=== START OF class DebugGlobalEditor_class ==============================================================================================================
 
 class DebugGlobalEditor_class:
@@ -720,7 +734,8 @@ class DebugGlobalEditor_class:
                     order = self._topo_sort({n: info_by_name.get(n, self._DepInfo(None, set(), False, None, ast.Constant(None))).depends_on for n in affected})
                     for name in order:
                         if name in changes:  # Skip variables that were directly changed by user
-                            continue                        info = info_by_name.get(name)
+                            continue
+                        info = info_by_name.get(name)
                         if not info or not info.eligible:
                             continue
                         try:
